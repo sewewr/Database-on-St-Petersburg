@@ -1,0 +1,252 @@
+-- SQL DML script: типовые запросы к БД ЖКХ, СПб
+-- Перед запуском замени bk_XXXXXX_2026 на свой логин/имя схемы.
+-- Скрипт рассчитан на таблицы, созданные в предыдущих этапах проекта.
+
+SET search_path TO bk_XXXXXX_2026;
+
+-- ============================================================
+-- Запрос 1.
+-- Поиск специалиста, способного в ближайшее время выполнить задачу.
+-- Пример: найти свободного сантехника для задачи по холодной воде.
+-- ============================================================
+
+SELECT
+    s.staff_id,
+    s.full_name,
+    sc.class_name,
+    s.qualification,
+    s.rating,
+    ss.work_date,
+    ss.time_from,
+    ss.time_to
+FROM staff s
+JOIN service_classes sc
+    ON sc.class_id = s.class_id
+JOIN staff_schedule ss
+    ON ss.staff_id = s.staff_id
+WHERE sc.class_name = 'сантехника'
+  AND s.is_available = TRUE
+  AND ss.is_busy = FALSE
+  AND ss.work_date >= CURRENT_DATE
+ORDER BY ss.work_date, ss.time_from, s.rating DESC
+LIMIT 5;
+
+
+-- ============================================================
+-- Запрос 2.
+-- TOP специалистов, которые выполнили наибольшее количество заявок
+-- в каждой категории в 2024, 2025 и 2026 годах.
+-- Используется оконная функция RANK().
+-- ============================================================
+
+WITH completed_tasks AS (
+    SELECT
+        EXTRACT(YEAR FROM t.completed_at)::int AS task_year,
+        sc.class_name,
+        s.staff_id,
+        s.full_name,
+        COUNT(t.task_id) AS completed_count
+    FROM tasks t
+    JOIN staff s
+        ON s.staff_id = t.assigned_staff_id
+    JOIN service_classes sc
+        ON sc.class_id = s.class_id
+    WHERE t.task_status = 'done'
+      AND t.completed_at IS NOT NULL
+      AND EXTRACT(YEAR FROM t.completed_at)::int IN (2024, 2025, 2026)
+    GROUP BY
+        EXTRACT(YEAR FROM t.completed_at)::int,
+        sc.class_name,
+        s.staff_id,
+        s.full_name
+),
+ranked_specialists AS (
+    SELECT
+        task_year,
+        class_name,
+        staff_id,
+        full_name,
+        completed_count,
+        RANK() OVER (
+            PARTITION BY task_year, class_name
+            ORDER BY completed_count DESC
+        ) AS specialist_rank
+    FROM completed_tasks
+)
+SELECT
+    task_year,
+    class_name,
+    staff_id,
+    full_name,
+    completed_count,
+    specialist_rank
+FROM ranked_specialists
+WHERE specialist_rank <= 3
+ORDER BY task_year, class_name, specialist_rank;
+
+
+-- ============================================================
+-- Запрос 3.
+-- Список зданий Санкт-Петербурга с количеством помещений.
+-- Помогает оценить, сколько жилых/технических помещений заведено
+-- для каждого дома.
+-- ============================================================
+
+SELECT
+    b.building_id,
+    b.address_full,
+    b.street,
+    b.house_number,
+    b.levels,
+    COUNT(p.premise_id) AS premises_count
+FROM buildings b
+LEFT JOIN premises p
+    ON p.building_id = b.building_id
+GROUP BY
+    b.building_id,
+    b.address_full,
+    b.street,
+    b.house_number,
+    b.levels
+ORDER BY premises_count DESC, b.building_id
+LIMIT 20;
+
+
+-- ============================================================
+-- Запрос 4.
+-- Количество заявок по статусам.
+-- Позволяет быстро увидеть текущую нагрузку организации.
+-- ============================================================
+
+SELECT
+    task_status,
+    COUNT(*) AS tasks_count
+FROM tasks
+GROUP BY task_status
+ORDER BY tasks_count DESC;
+
+
+-- ============================================================
+-- Запрос 5.
+-- Просроченные заявки.
+-- Выводит задачи, срок выполнения которых уже прошел,
+-- но они еще не выполнены.
+-- ============================================================
+
+SELECT
+    t.task_id,
+    b.address_full,
+    b.street,
+    b.house_number,
+    st.service_name,
+    sc.class_name,
+    s.full_name AS assigned_specialist,
+    t.task_status,
+    t.created_at,
+    t.due_at,
+    t.priority
+FROM tasks t
+JOIN buildings b
+    ON b.building_id = t.building_id
+JOIN service_types st
+    ON st.service_type_id = t.service_type_id
+JOIN service_classes sc
+    ON sc.class_id = st.class_id
+LEFT JOIN staff s
+    ON s.staff_id = t.assigned_staff_id
+WHERE t.task_status <> 'done'
+  AND t.due_at < CURRENT_TIMESTAMP
+ORDER BY t.priority DESC, t.due_at ASC;
+
+
+-- ============================================================
+-- Запрос 6.
+-- Количество заявок по классам сервисных функций.
+-- Показывает, по каким направлениям больше всего обращений:
+-- электрика, сантехника, лифты, домофоны и т.д.
+-- ============================================================
+
+SELECT
+    sc.class_name,
+    COUNT(t.task_id) AS tasks_count
+FROM tasks t
+JOIN service_types st
+    ON st.service_type_id = t.service_type_id
+JOIN service_classes sc
+    ON sc.class_id = st.class_id
+GROUP BY sc.class_name
+ORDER BY tasks_count DESC;
+
+
+-- ============================================================
+-- Запрос 7.
+-- Дома, в которых есть сервисные функции в статусе repair.
+-- То есть сервисы, требующие ремонта.
+-- ============================================================
+
+SELECT
+    b.building_id,
+    b.address_full,
+    b.street,
+    b.house_number,
+    st.service_name,
+    sc.class_name,
+    bs.service_status,
+    bs.last_check_at,
+    bs.comment
+FROM building_services bs
+JOIN buildings b
+    ON b.building_id = bs.building_id
+JOIN service_types st
+    ON st.service_type_id = bs.service_type_id
+JOIN service_classes sc
+    ON sc.class_id = st.class_id
+WHERE bs.service_status = 'repair'
+ORDER BY bs.last_check_at ASC, b.building_id;
+
+
+-- ============================================================
+-- Запрос 8. Дополнительный.
+-- Средняя этажность зданий по улицам.
+-- Используется реальный атрибут levels из OSM-датасета.
+-- ============================================================
+
+SELECT
+    street,
+    COUNT(*) AS buildings_count,
+    ROUND(AVG(levels)::numeric, 2) AS avg_levels,
+    MIN(levels) AS min_levels,
+    MAX(levels) AS max_levels
+FROM buildings
+WHERE street IS NOT NULL
+  AND street <> 'Unknown'
+  AND levels IS NOT NULL
+GROUP BY street
+HAVING COUNT(*) >= 3
+ORDER BY avg_levels DESC, buildings_count DESC;
+
+
+-- ============================================================
+-- Запрос 9. Дополнительный.
+-- Сводка по специалистам: количество назначенных и выполненных задач.
+-- ============================================================
+
+SELECT
+    s.staff_id,
+    s.full_name,
+    sc.class_name,
+    s.rating,
+    COUNT(t.task_id) AS assigned_tasks,
+    COUNT(t.task_id) FILTER (WHERE t.task_status = 'done') AS completed_tasks,
+    COUNT(t.task_id) FILTER (WHERE t.task_status <> 'done') AS active_tasks
+FROM staff s
+JOIN service_classes sc
+    ON sc.class_id = s.class_id
+LEFT JOIN tasks t
+    ON t.assigned_staff_id = s.staff_id
+GROUP BY
+    s.staff_id,
+    s.full_name,
+    sc.class_name,
+    s.rating
+ORDER BY completed_tasks DESC, assigned_tasks DESC, s.rating DESC;
